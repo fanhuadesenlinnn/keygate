@@ -87,6 +87,32 @@ func daysLeft(left time.Duration) int {
 	return max(1, int(math.Ceil(left.Hours()/24)))
 }
 
+// utcDate is the calendar date a customer is shown for a license date, in
+// UTC. Timestamps scanned from the database carry the connection's time
+// zone, so formatting them directly names a different day on a server whose
+// zone is not UTC; the updates-ending reminder already formats in UTC.
+func utcDate(t time.Time) string {
+	return t.UTC().Format("2006-01-02")
+}
+
+// canRemind reports whether a reminder sweep should queue anything: its
+// switch is on and email is set up. Without email the queue does not
+// drain, so a reminder queued now would go out whenever email is finally
+// configured, long after it stopped being true. Nothing is claimed in
+// that case, so the reminder a license is due at that point still goes
+// out, once.
+func (c *ExpiryChecker) canRemind(kind string) bool {
+	if c.email == nil || !c.email.NotifyEnabled(kind) {
+		return false
+	}
+	configured, err := c.email.Configured()
+	if err != nil {
+		c.logger.Warn("email config unreadable; skipping reminders this run", "kind", kind, "error", err)
+		return false
+	}
+	return configured
+}
+
 func (c *ExpiryChecker) reminderDays(ctx context.Context) []int {
 	raw, err := c.store.GetSetting(ctx, ReminderDaysSetting)
 	if err != nil || strings.TrimSpace(raw) == "" {
@@ -108,7 +134,7 @@ func (c *ExpiryChecker) reminderDays(ctx context.Context) []int {
 func (c *ExpiryChecker) SendExpiryReminders(ctx context.Context) {
 	// Turned off: record nothing, so switching it back on reminds the
 	// licenses still inside a window (each once, for the window it is in).
-	if !c.email.NotifyEnabled("license_expiring") {
+	if !c.canRemind("license_expiring") {
 		return
 	}
 	days := c.reminderDays(ctx)
@@ -159,7 +185,7 @@ func (c *ExpiryChecker) remindExpiring(ctx context.Context, lic *model.License, 
 	}
 	trial := lic.Status == model.StatusTrialing
 	subject, body := c.email.RenderLicenseExpiring(productName, c.store.DecryptLicenseKey(lic),
-		lic.ValidUntil.Format("2006-01-02"), daysLeft(left), trial, c.trialFallbackName(ctx, lic, trial))
+		utcDate(*lic.ValidUntil), daysLeft(left), trial, c.trialFallbackName(ctx, lic, trial))
 	switch err := c.store.EnqueueEmailAndCloseNotification(ctx, lic.Email, subject, body, token); {
 	case err == nil:
 		c.logger.Info("expiry reminder queued", "license_id", lic.ID, "window_days", window)
